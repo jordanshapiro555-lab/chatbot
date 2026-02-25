@@ -1,11 +1,5 @@
 export default {
-  async fetch(request, env) {
-    if (request.method === "GET") {
-  return new Response("chatbot worker v1", {
-    headers: { "Content-Type": "text/plain" , "Access-Control-Allow-Origin": "*" },
-  });
-}
-    
+  async fetch(request, env) {    
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
