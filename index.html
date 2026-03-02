@@ -1,9 +1,15 @@
 <script>
+document.addEventListener("DOMContentLoaded", () => {
   const WORKER_URL = "https://chatbot.jordanshapiro555.workers.dev";
 
   const log = document.getElementById("log");
   const form = document.getElementById("chat");
   const input = document.getElementById("text");
+
+  if (!log || !form || !input) {
+    console.error("Missing required elements:", { log, form, input });
+    return;
+  }
 
   const messages = [
     { role: "system", content: "You are a helpful, concise assistant." }
@@ -28,21 +34,18 @@
 
     try {
       const res = await fetch(WORKER_URL, {
-        method: "POST", // REQUIRED (otherwise you will get 405)
+        method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages }),
       });
 
-      // If Worker returns 405/500, show the text for debugging
+      const raw = await res.text();
       if (!res.ok) {
-        const t = await res.text();
-        addLine("Bot", `Error ${res.status}: ${t}`, "bot");
+        addLine("Bot", `Error ${res.status}: ${raw}`, "bot");
         return;
       }
 
-      const data = await res.json();
-
-      // Cloudflare AI can return different shapes; try common ones
+      const data = JSON.parse(raw);
       const reply =
         data.response ??
         data.result?.response ??
@@ -56,4 +59,5 @@
       addLine("Bot", `Fetch failed: ${err}`, "bot");
     }
   });
+});
 </script>
