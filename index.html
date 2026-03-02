@@ -1,63 +1,90 @@
-<script>
-document.addEventListener("DOMContentLoaded", () => {
-  const WORKER_URL = "https://chatbot.jordanshapiro555.workers.dev";
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>My Chatbot</title>
+    <style>
+      body { font-family: system-ui; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+      #log { border: 1px solid #ddd; border-radius: 12px; padding: 12px; min-height: 240px; }
+      .msg { margin: 10px 0; }
+      .me { font-weight: 600; }
+      .bot { color: #111; }
+      form { display: flex; gap: 8px; margin-top: 12px; }
+      input { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; }
+      button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>My Chatbot</h1>
 
-  const log = document.getElementById("log");
-  const form = document.getElementById("chat");
-  const input = document.getElementById("text");
+    <div id="log"></div>
 
-  if (!log || !form || !input) {
-    console.error("Missing required elements:", { log, form, input });
-    return;
-  }
+    <form id="chat">
+      <input id="text" placeholder="Ask something..." autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
 
-  const messages = [
-    { role: "system", content: "You are a helpful, concise assistant." }
-  ];
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        const WORKER_URL = "https://chatbot.jordanshapiro555.workers.dev";
 
-  function addLine(label, text, cls) {
-    const div = document.createElement("div");
-    div.className = "msg " + cls;
-    div.innerHTML = `<span class="${cls === "me" ? "me" : "bot"}">${label}:</span> ${text}`;
-    log.appendChild(div);
-    log.scrollTop = log.scrollHeight;
-  }
+        const log = document.getElementById("log");
+        const form = document.getElementById("chat");
+        const input = document.getElementById("text");
 
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const text = input.value.trim();
-    if (!text) return;
+        if (!log || !form || !input) {
+          console.error("Missing required elements:", { log, form, input });
+          return;
+        }
 
-    addLine("You", text, "me");
-    messages.push({ role: "user", content: text });
-    input.value = "";
+        const messages = [{ role: "system", content: "You are a helpful, concise assistant." }];
 
-    try {
-      const res = await fetch(WORKER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages }),
+        function addLine(label, text, cls) {
+          const div = document.createElement("div");
+          div.className = "msg " + cls;
+          div.innerHTML = `<span class="${cls === "me" ? "me" : "bot"}">${label}:</span> ${text}`;
+          log.appendChild(div);
+          log.scrollTop = log.scrollHeight;
+        }
+
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const text = input.value.trim();
+          if (!text) return;
+
+          addLine("You", text, "me");
+          messages.push({ role: "user", content: text });
+          input.value = "";
+
+          try {
+            const res = await fetch(WORKER_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ messages }),
+            });
+
+            const raw = await res.text();
+            if (!res.ok) {
+              addLine("Bot", `Error ${res.status}: ${raw}`, "bot");
+              return;
+            }
+
+            const data = JSON.parse(raw);
+            const reply =
+              data.response ??
+              data.result?.response ??
+              data.result ??
+              data?.choices?.[0]?.message?.content ??
+              JSON.stringify(data);
+
+            addLine("Bot", reply, "bot");
+            messages.push({ role: "assistant", content: reply });
+          } catch (err) {
+            addLine("Bot", `Fetch failed: ${err}`, "bot");
+          }
+        });
       });
-
-      const raw = await res.text();
-      if (!res.ok) {
-        addLine("Bot", `Error ${res.status}: ${raw}`, "bot");
-        return;
-      }
-
-      const data = JSON.parse(raw);
-      const reply =
-        data.response ??
-        data.result?.response ??
-        data.result ??
-        data?.choices?.[0]?.message?.content ??
-        JSON.stringify(data);
-
-      addLine("Bot", reply, "bot");
-      messages.push({ role: "assistant", content: reply });
-    } catch (err) {
-      addLine("Bot", `Fetch failed: ${err}`, "bot");
-    }
-  });
-});
-</script>
+    </script>
+  </body>
+</html>
