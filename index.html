@@ -6,23 +6,24 @@
     <title>My Chatbot</title>
     <style>
       body { font-family: system-ui; max-width: 720px; margin: 40px auto; padding: 0 16px; }
-      #log { border: 1px solid #ddd; border-radius: 12px; padding: 12px; min-height: 240px; }
-      .msg { margin: 10px 0; }
-      .me { font-weight: 600; }
-      .bot { color: #111; }
+      #log { border: 1px solid #ddd; border-radius: 12px; padding: 12px; min-height: 260px; }
+      .msg { margin: 10px 0; line-height: 1.35; }
+      .me { font-weight: 700; }
+      .bot { font-weight: 700; }
       form { display: flex; gap: 8px; margin-top: 12px; }
       input { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; }
-      button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; }
+      button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      .bubble { white-space: pre-wrap; }
     </style>
   </head>
   <body>
     <h1>My Chatbot</h1>
-
     <div id="log"></div>
 
     <form id="chat">
       <input id="text" placeholder="Ask something..." autocomplete="off" />
-      <button type="submit">Send</button>
+      <button id="send" type="submit">Send</button>
     </form>
 
     <script>
@@ -32,20 +33,68 @@
         const log = document.getElementById("log");
         const form = document.getElementById("chat");
         const input = document.getElementById("text");
+        const btn = document.getElementById("send");
 
-        if (!log || !form || !input) {
-          console.error("Missing required elements:", { log, form, input });
-          return;
-        }
-
-        const messages = [{ role: "system", content: "You are a helpful, concise assistant." }];
+        const messages = [
+          { role: "system", content: "You are a helpful, concise assistant." }
+        ];
 
         function addLine(label, text, cls) {
           const div = document.createElement("div");
-          div.className = "msg " + cls;
-          div.innerHTML = `<span class="${cls === "me" ? "me" : "bot"}">${label}:</span> ${text}`;
+          div.className = "msg";
+          div.innerHTML = `<span class="${cls}">${label}:</span> <span class="bubble"></span>`;
+          div.querySelector(".bubble").textContent = text || "";
           log.appendChild(div);
           log.scrollTop = log.scrollHeight;
+          return div.querySelector(".bubble"); // return the bubble span for streaming
+        }
+
+        async function readSSE(stream, onToken) {
+          const reader = stream.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buf += decoder.decode(value, { stream: true });
+
+            // SSE events separated by double newline
+            const parts = buf.split("\n\n");
+            buf = parts.pop() || "";
+
+            for (const part of parts) {
+              // Typical SSE lines like: "data: {...}"
+              const lines = part.split("\n");
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith("data:")) continue;
+
+                const payload = trimmed.slice(5).trim();
+                if (!payload || payload === "[DONE]") continue;
+
+                // Payload may be JSON or plain text depending on provider
+                try {
+                  const obj = JSON.parse(payload);
+
+                  // Try common token fields
+                  const token =
+                    obj?.response ??
+                    obj?.delta ??
+                    obj?.token ??
+                    obj?.text ??
+                    obj?.choices?.[0]?.delta?.content ??
+                    obj?.choices?.[0]?.text;
+
+                  if (token) onToken(token);
+                } catch {
+                  // If it's not JSON, treat as plain text chunk
+                  onToken(payload);
+                }
+              }
+            }
+          }
         }
 
         form.addEventListener("submit", async (e) => {
@@ -53,9 +102,13 @@
           const text = input.value.trim();
           if (!text) return;
 
+          btn.disabled = true;
+
           addLine("You", text, "me");
           messages.push({ role: "user", content: text });
           input.value = "";
+
+          const botBubble = addLine("Bot", "", "bot");
 
           try {
             const res = await fetch(WORKER_URL, {
@@ -64,24 +117,27 @@
               body: JSON.stringify({ messages }),
             });
 
-            const raw = await res.text();
             if (!res.ok) {
-              addLine("Bot", `Error ${res.status}: ${raw}`, "bot");
+              const raw = await res.text();
+              botBubble.textContent = `Error ${res.status}: ${raw}`;
+              btn.disabled = false;
               return;
             }
 
-            const data = JSON.parse(raw);
-            const reply =
-              data.response ??
-              data.result?.response ??
-              data.result ??
-              data?.choices?.[0]?.message?.content ??
-              JSON.stringify(data);
+            // Stream into the bubble
+            let full = "";
+            await readSSE(res.body, (tok) => {
+              full += tok;
+              botBubble.textContent = full;
+              log.scrollTop = log.scrollHeight;
+            });
 
-            addLine("Bot", reply, "bot");
-            messages.push({ role: "assistant", content: reply });
+            // Save assistant response to context
+            messages.push({ role: "assistant", content: full || botBubble.textContent });
           } catch (err) {
-            addLine("Bot", `Fetch failed: ${err}`, "bot");
+            botBubble.textContent = `Fetch failed: ${err}`;
+          } finally {
+            btn.disabled = false;
           }
         });
       });
