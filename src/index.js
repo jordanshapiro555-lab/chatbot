@@ -1,10 +1,9 @@
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-// Pull the most recent user message for search/debug
 function getLastUserMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -13,7 +12,6 @@ function getLastUserMessage(messages) {
   return "";
 }
 
-// Basic keyword extraction (v1)
 function extractTerms(text, maxTerms = 6) {
   return String(text || "")
     .toLowerCase()
@@ -25,7 +23,7 @@ function extractTerms(text, maxTerms = 6) {
 
 export default {
   async fetch(request, env) {
-    // Preflight
+    // CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -42,7 +40,6 @@ export default {
     }
 
     try {
-      // Bindings checks
       if (!env.AI) {
         return new Response(JSON.stringify({ error: "Missing AI binding env.AI" }), {
           status: 500,
@@ -69,7 +66,7 @@ export default {
       const userText = getLastUserMessage(messages);
       const terms = extractTerms(userText);
 
-      // Build a simple OR-based LIKE query across title/content
+      // Keyword search in D1 (v1)
       let where = "";
       const params = [];
       if (terms.length) {
@@ -89,10 +86,9 @@ export default {
       const results = await env.DB.prepare(sql).bind(...params).all();
       const rows = results?.results || [];
 
-      // 🔎 Debug mode: returns what DB search found (JSON), not streaming
-      // Use by asking: "debug_kb secret test phrase"
+      // Debug mode: return the DB hits as JSON
       if (userText.toLowerCase().includes("debug_kb")) {
-        return new Response(JSON.stringify({ terms, rowsFound: rows.length, rows }), {
+        return new Response(JSON.stringify({ terms, rowsFound: rows.length, rows }, null, 2), {
           headers: { ...corsHeaders, "Content-Type": "application/json" },
         });
       }
@@ -102,7 +98,6 @@ export default {
           ? rows.map((r, i) => `Source ${i + 1}: ${r.title}\n${r.content}`).join("\n\n---\n\n")
           : "No relevant knowledge found.";
 
-      // Strict RAG instruction: answer ONLY from knowledge
       const ragSystem = {
         role: "system",
         content:
@@ -115,7 +110,7 @@ export default {
 
       const finalMessages = [ragSystem, ...messages];
 
-      // ✅ Streaming response (matches your streaming UI)
+      // Streaming response (SSE)
       const stream = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
         messages: finalMessages,
         max_tokens: 450,
