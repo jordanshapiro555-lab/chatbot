@@ -1,8 +1,19 @@
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, X-Admin-Token",
 };
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+function textResp(t, status = 200) {
+  return new Response(t, { status, headers: { ...corsHeaders, "Content-Type": "text/plain" } });
+}
 
 function getLastUserMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -12,124 +23,130 @@ function getLastUserMessage(messages) {
   return "";
 }
 
-function extractTerms(text, maxTerms = 6) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, maxTerms);
+// Embedding model (768 dims)
+async function embed(env, text) {
+  const out = await env.AI.run("@cf/baai/bge-base-en-v1.5", { text });
+  const vec = out?.data?.[0];
+  if (!vec) throw new Error("Embedding failed");
+  return vec;
+}
+
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i], y = b[i];
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom ? dot / denom : 0;
+}
+
+function requireAdmin(request, env) {
+  const tok = request.headers.get("X-Admin-Token") || "";
+  return !!env.ADMIN_TOKEN && tok === env.ADMIN_TOKEN;
 }
 
 export default {
   async fetch(request, env) {
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders });
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+
+    if (!env.AI) return json({ error: "Missing Workers AI binding env.AI" }, 500);
+    if (!env.DB) return json({ error: "Missing D1 binding env.DB" }, 500);
+
+    const url = new URL(request.url);
+
+    if (request.method === "GET") return textResp("worker alive");
+
+    // ADMIN: embed everything in kb into kb_embeddings
+    if (request.method === "POST" && url.pathname === "/embed_all") {
+      if (!requireAdmin(request, env)) return json({ error: "Unauthorized" }, 401);
+
+      const { results } = await env.DB.prepare("SELECT id, title, content FROM kb").all();
+      const rows = results || [];
+
+      let embedded = 0;
+
+      for (const r of rows) {
+        const vec = await embed(env, `${r.title}\n\n${r.content}`);
+        await env.DB.prepare(
+          `INSERT INTO kb_embeddings (kb_id, embedding, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(kb_id) DO UPDATE SET embedding=excluded.embedding, updated_at=datetime('now')`
+        ).bind(r.id, JSON.stringify(vec)).run();
+        embedded++;
+      }
+
+      return json({ ok: true, embedded });
     }
 
-    // Health check
-    if (request.method === "GET") {
-      return new Response("worker alive", {
-        headers: { ...corsHeaders, "Content-Type": "text/plain" },
-      });
+    // CHAT
+    if (request.method !== "POST") return textResp("POST only", 405);
+
+    const body = await request.json().catch(() => ({}));
+    const messages = body?.messages;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return json({ error: "Body must include { messages: [...] }" }, 400);
     }
 
-    if (request.method !== "POST") {
-      return new Response("POST only", { status: 405, headers: corsHeaders });
+    const question = getLastUserMessage(messages).slice(0, 2000);
+    if (!question) return json({ error: "No user message found" }, 400);
+
+    // Embed user question
+    const qVec = await embed(env, question);
+
+    // Load embeddings + kb rows
+    const { results: joinRows } = await env.DB.prepare(`
+      SELECT kb.id, kb.title, kb.content, emb.embedding
+      FROM kb kb
+      LEFT JOIN kb_embeddings emb ON emb.kb_id = kb.id
+    `).all();
+
+    const candidates = (joinRows || [])
+      .map((r) => {
+        let v = null;
+        try { v = r.embedding ? JSON.parse(r.embedding) : null; } catch {}
+        return { id: r.id, title: r.title, content: r.content, vec: v };
+      })
+      .filter((c) => Array.isArray(c.vec) && c.vec.length);
+
+    // If no embeddings exist yet, tell user to run /embed_all
+    if (candidates.length === 0) {
+      return json({
+        error: "No embeddings found. Run POST /embed_all with X-Admin-Token first.",
+      }, 500);
     }
 
-    try {
-      if (!env.AI) {
-        return new Response(JSON.stringify({ error: "Missing AI binding env.AI" }), {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-      if (!env.DB) {
-        return new Response(JSON.stringify({ error: "Missing D1 binding env.DB" }), {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+    // Score + topK
+    const scored = candidates
+      .map((c) => ({ ...c, score: cosineSim(qVec, c.vec) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4);
 
-      const body = await request.json();
-      const messages = body?.messages;
+    const context = scored.length
+      ? scored.map((r, i) => `Source ${i + 1} (score ${r.score.toFixed(3)}): ${r.title}\n${r.content}`).join("\n\n---\n\n")
+      : "No relevant knowledge found.";
 
-      if (!Array.isArray(messages) || messages.length === 0) {
-        return new Response(JSON.stringify({ error: "Body must include { messages: [...] }" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+    const ragSystem = {
+      role: "system",
+      content:
+        "Use the KNOWLEDGE below when answering. If it does not contain the answer, say you don't know.\n\n" +
+        "KNOWLEDGE:\n" + context,
+    };
 
-      const userText = getLastUserMessage(messages);
-      const terms = extractTerms(userText);
+    const finalMessages = [ragSystem, ...messages];
 
-      // Keyword search in D1 (v1)
-      let where = "";
-      const params = [];
-      if (terms.length) {
-        where =
-          "WHERE " +
-          terms.map(() => "(lower(title) LIKE ? OR lower(content) LIKE ?)").join(" OR ");
-        for (const t of terms) params.push(`%${t}%`, `%${t}%`);
-      }
+    const result = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      messages: finalMessages,
+      max_tokens: 400,
+    });
 
-      const sql = `
-        SELECT title, content
-        FROM kb
-        ${where}
-        LIMIT 4
-      `;
-
-      const results = await env.DB.prepare(sql).bind(...params).all();
-      const rows = results?.results || [];
-
-      // Debug mode: return the DB hits as JSON
-      if (userText.toLowerCase().includes("debug_kb")) {
-        return new Response(JSON.stringify({ terms, rowsFound: rows.length, rows }, null, 2), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      const context =
-        rows.length > 0
-          ? rows.map((r, i) => `Source ${i + 1}: ${r.title}\n${r.content}`).join("\n\n---\n\n")
-          : "No relevant knowledge found.";
-
-      const ragSystem = {
-        role: "system",
-        content:
-          "You answer using ONLY the KNOWLEDGE below. " +
-          "If the answer is not explicitly in the knowledge, say: 'I don't know based on the provided knowledge.' " +
-          "Do not invent facts.\n\n" +
-          "KNOWLEDGE:\n" +
-          context,
-      };
-
-      const finalMessages = [ragSystem, ...messages];
-
-      // Streaming response (SSE)
-      const stream = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-        messages: finalMessages,
-        max_tokens: 450,
-        stream: true,
-      });
-
-      return new Response(stream, {
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: String(err) }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    return json({
+      answer: result?.response ?? result,
+      retrieved: scored.map((r) => ({ id: r.id, title: r.title, score: r.score })),
+    });
   },
 };
