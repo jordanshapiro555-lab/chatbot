@@ -10,11 +10,11 @@
       .msg { margin: 10px 0; line-height: 1.35; }
       .me { font-weight: 700; }
       .bot { font-weight: 700; }
+      .bubble { white-space: pre-wrap; }
       form { display: flex; gap: 8px; margin-top: 12px; }
       input { flex: 1; padding: 10px 12px; border-radius: 10px; border: 1px solid #ccc; }
       button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
       button:disabled { opacity: .6; cursor: not-allowed; }
-      .bubble { white-space: pre-wrap; }
     </style>
   </head>
   <body>
@@ -43,29 +43,31 @@
           const div = document.createElement("div");
           div.className = "msg";
           div.innerHTML = `<span class="${cls}">${label}:</span> <span class="bubble"></span>`;
-          div.querySelector(".bubble").textContent = text || "";
+          const bubble = div.querySelector(".bubble");
+          bubble.textContent = text || "";
           log.appendChild(div);
           log.scrollTop = log.scrollHeight;
-          return div.querySelector(".bubble"); // return the bubble span for streaming
+          return bubble; // for streaming updates
         }
 
-        async function readSSE(stream, onToken) {
+        // Read SSE stream and extract "data:" chunks.
+        // If data is JSON, we try to pull token fields; otherwise we append raw text.
+        async function readSSE(stream, onChunk) {
           const reader = stream.getReader();
           const decoder = new TextDecoder();
-          let buf = "";
+          let buffer = "";
 
           while (true) {
             const { value, done } = await reader.read();
             if (done) break;
 
-            buf += decoder.decode(value, { stream: true });
+            buffer += decoder.decode(value, { stream: true });
 
-            // SSE events separated by double newline
-            const parts = buf.split("\n\n");
-            buf = parts.pop() || "";
+            // SSE events separated by blank line
+            const parts = buffer.split("\n\n");
+            buffer = parts.pop() || "";
 
             for (const part of parts) {
-              // Typical SSE lines like: "data: {...}"
               const lines = part.split("\n");
               for (const line of lines) {
                 const trimmed = line.trim();
@@ -74,11 +76,9 @@
                 const payload = trimmed.slice(5).trim();
                 if (!payload || payload === "[DONE]") continue;
 
-                // Payload may be JSON or plain text depending on provider
+                // Try JSON token shapes first
                 try {
                   const obj = JSON.parse(payload);
-
-                  // Try common token fields
                   const token =
                     obj?.response ??
                     obj?.delta ??
@@ -87,10 +87,11 @@
                     obj?.choices?.[0]?.delta?.content ??
                     obj?.choices?.[0]?.text;
 
-                  if (token) onToken(token);
+                  if (token) onChunk(String(token));
+                  else onChunk(payload);
                 } catch {
-                  // If it's not JSON, treat as plain text chunk
-                  onToken(payload);
+                  // Not JSON: append as-is
+                  onChunk(payload);
                 }
               }
             }
@@ -117,6 +118,19 @@
               body: JSON.stringify({ messages }),
             });
 
+            const contentType = res.headers.get("content-type") || "";
+
+            // If JSON (debug_kb or errors), show it directly
+            if (contentType.includes("application/json")) {
+              const data = await res.json();
+              const pretty = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+              botBubble.textContent = pretty;
+              messages.push({ role: "assistant", content: pretty });
+              btn.disabled = false;
+              return;
+            }
+
+            // Otherwise treat as streaming SSE
             if (!res.ok) {
               const raw = await res.text();
               botBubble.textContent = `Error ${res.status}: ${raw}`;
@@ -124,15 +138,13 @@
               return;
             }
 
-            // Stream into the bubble
             let full = "";
-            await readSSE(res.body, (tok) => {
-              full += tok;
+            await readSSE(res.body, (chunk) => {
+              full += chunk;
               botBubble.textContent = full;
               log.scrollTop = log.scrollHeight;
             });
 
-            // Save assistant response to context
             messages.push({ role: "assistant", content: full || botBubble.textContent });
           } catch (err) {
             botBubble.textContent = `Fetch failed: ${err}`;
