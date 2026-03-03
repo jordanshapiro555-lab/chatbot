@@ -4,6 +4,7 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+// Pull the most recent user message for search/debug
 function getLastUserMessage(messages) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -12,10 +13,24 @@ function getLastUserMessage(messages) {
   return "";
 }
 
+// Basic keyword extraction (v1)
+function extractTerms(text, maxTerms = 6) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, maxTerms);
+}
+
 export default {
   async fetch(request, env) {
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+    // Preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
 
+    // Health check
     if (request.method === "GET") {
       return new Response("worker alive", {
         headers: { ...corsHeaders, "Content-Type": "text/plain" },
@@ -27,6 +42,7 @@ export default {
     }
 
     try {
+      // Bindings checks
       if (!env.AI) {
         return new Response(JSON.stringify({ error: "Missing AI binding env.AI" }), {
           status: 500,
@@ -50,14 +66,10 @@ export default {
         });
       }
 
-      const userText = getLastUserMessage(messages).toLowerCase().slice(0, 200);
+      const userText = getLastUserMessage(messages);
+      const terms = extractTerms(userText);
 
-      const terms = userText
-        .replace(/[^a-z0-9\s]/g, " ")
-        .split(/\s+/)
-        .filter(Boolean)
-        .slice(0, 6);
-
+      // Build a simple OR-based LIKE query across title/content
       let where = "";
       const params = [];
       if (terms.length) {
@@ -77,31 +89,46 @@ export default {
       const results = await env.DB.prepare(sql).bind(...params).all();
       const rows = results?.results || [];
 
-      console.log("Search terms:", terms);
-      console.log("Rows found:", rows.length);
+      // 🔎 Debug mode: returns what DB search found (JSON), not streaming
+      // Use by asking: "debug_kb secret test phrase"
+      if (userText.toLowerCase().includes("debug_kb")) {
+        return new Response(JSON.stringify({ terms, rowsFound: rows.length, rows }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
       const context =
         rows.length > 0
           ? rows.map((r, i) => `Source ${i + 1}: ${r.title}\n${r.content}`).join("\n\n---\n\n")
           : "No relevant knowledge found.";
 
+      // Strict RAG instruction: answer ONLY from knowledge
       const ragSystem = {
         role: "system",
         content:
-          "Answer using ONLY the KNOWLEDGE below. If the answer is not in the knowledge, say 'I don't know.'\n\n" +
+          "You answer using ONLY the KNOWLEDGE below. " +
+          "If the answer is not explicitly in the knowledge, say: 'I don't know based on the provided knowledge.' " +
+          "Do not invent facts.\n\n" +
           "KNOWLEDGE:\n" +
           context,
       };
 
       const finalMessages = [ragSystem, ...messages];
 
-      const aiResult = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      // ✅ Streaming response (matches your streaming UI)
+      const stream = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
         messages: finalMessages,
-        max_tokens: 350,
+        max_tokens: 450,
+        stream: true,
       });
 
-      return new Response(JSON.stringify(aiResult), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      return new Response(stream, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
       });
     } catch (err) {
       return new Response(JSON.stringify({ error: String(err) }), {
